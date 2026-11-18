@@ -1,0 +1,155 @@
+Design Specification: tpt-vfx
+Project: TPT Solutions Ecosystem
+Module: tpt-vfx (Pure-Rust, Zero-C++, MIT-licensed Movie Graphics & SFX Pipeline)
+Status: Draft / RFC
+Target Domains: High-end Film VFX, Virtual Production, Real-time SFX, Mathematical Verification
+1. Executive Summary
+tpt-vfx is a high-performance, mathematically verifiable, pure-Rust Special Effects and Movie Graphics orchestration library. It is designed to replace the legacy C++ monoliths of the VFX industry (OpenVDB, Houdini DOPs, Embree, USD) with a memory-safe, zero-copy, formally verified pipeline.
+tpt-vfx does not rebuild the wheel; it acts as the SFX orchestration layer that wires together your existing TPT foundational crates (tpt-nova, tpt-physics-engine, tpt-math, tpt-solver) into a cohesive, production-ready rendering and simulation pipeline.
+2. Core Tenets & Constraints
+Zero C++ FFI: No bindings to OpenVDB, Embree, Alembic, or USD. All geometry, volumetrics, and ray-intersection algorithms are implemented natively in Rust and WGSL.
+Strict MIT Licensing: No Apache-2.0-only dependencies. Leverages the in-house replacements in tpt-math (which removed nalgebra, faer, etc.) and strictly selects the MIT license for all dual-licensed crates.
+Zero-Copy Architecture: Scene data, simulation grids, and GPU buffers share memory layouts where possible, leveraging tpt-archon principles to stream terabytes of VFX caches without CPU bottlenecks.
+Verified SFX: Simulation stability is guaranteed via tpt-solver certificate checking. A simulation will never "explode" due to numerical instability without the checker catching it.
+3. High-Level Architecture
+tpt-vfx is divided into four primary workspace crates that bridge your existing ecosystem:
+
+┌──────────────────────────────────────────────────────────────────┐
+│                         tpt-vfx (Orchestrator)                   │
+├──────────────┬──────────────┬───────────────┬────────────────────┤
+│  vfx-scene   │  vfx-volume  │   vfx-rays    │   vfx-constraints  │
+│ (Zero-Copy   │ (Sparse Voxel│ (WGSL Path    │ (SMT/SAT Verified  │
+│  Scene Graph)│  & MAC Grid) │  Tracing)     │  Cloth/Rigid/IK)   │
+└──────┬───────┴──────┬───────┴───────┬───────┴─────────┬──────────┘
+       │              │               │                 │
+       ▼              ▼               ▼                 ▼
+┌────────────┐ ┌────────────┐ ┌────────────┐  ┌──────────────────┐
+│ tpt-nova   │ │ tpt-math   │ │ tpt-crucible│  │ tpt-solver       │
+│ (wgpu/ECS/ │ │ (PDE ops,  │ │ (Heterogen- │  │ (Certificate     │
+│  Splats)   │ │  Linalg)   │ │  eous Comp) │  │  Checker Kernel) │
+└────────────┘ └────────────┘ └────────────┘  └──────────────────┘
+       ▲              ▲               ▲                 ▲
+       │              │               │                 │
+┌──────┴──────────────┴───────────────┴─────────────────┴──────────┐
+│                    tpt-physics-engine                            │
+│             (SPH Fluids, Rigid Bodies, GJK/EPA Collisions)       │
+└──────────────────────────────────────────────────────────────────┘
+
+4. Subsystem Specifications
+4.1 vfx-scene: The Zero-Copy USD Alternative
+Instead of parsing heavy C++ USD/Alembic files, vfx-scene provides a binary, memory-mapped scene representation.
+Data Structure: Flat, cache-friendly arrays of ECS components (leveraging nova-ecs).
+I/O: Uses memmap2 (MIT) to map .vfx cache files directly into RAM. Pointers in the scene graph are represented as offsets, allowing instant loading of 100GB particle caches without deserialization overhead.
+Versioning: Managed by nova-scene serialization logic, but strictly optimized for read-only render farm access.
+4.2 vfx-volume: Pure Rust OpenVDB Replacement
+Movie SFX relies heavily on volumetrics (smoke, fire, clouds, magic). OpenVDB is a C++ monopoly. vfx-volume replaces it.
+Data Structure: Pure Rust Sparse Voxel Octree (SVO) and MAC Grid (Marker-and-Cell).
+Compute: Uses tpt-math-pde-operators to calculate Gradient, Divergence, and Laplacian on the staggered grid.
+Advection & Projection: Navier-Stokes fluid steps are dispatched via tpt-crucible to either CPU (rayon) or GPU (WGSL compute shaders via nova-render).
+Output: Generates 3D density and temperature grids that vfx-rays can raymarch.
+4.3 vfx-rays: WGSL Compute Path Tracer
+Replaces Embree/OptiX/Arnold. A fully software-rasterized and ray-traced fallback built entirely in Rust and WGSL.
+BVH Construction: A highly parallel, top-down Bounding Volume Hierarchy builder written in pure Rust (using tpt-math-geometry for AABB intersections).
+Shader Execution: The BVH is uploaded to wgpu storage buffers. WGSL compute shaders traverse the BVH to calculate ray-mesh and ray-volume intersections.
+Neural Volumetrics: Integrates with nova-neural-materials and nova-splat to raymarch Gaussian Splats and AI-generated volumetric density fields natively.
+4.4 vfx-constraints: Verified Simulation Layer
+This is the differentiator. VFX simulations (cloth, water, destruction) often fail due to floating-point drift or interpenetration.
+Integration: Wraps tpt-physics-engine simulation steps.
+Verification: After the physics engine calculates a frame of cloth or rigid body destruction, it generates a logical proof of constraint satisfaction (e.g., "Distance between vertex A and B remains within tolerance").
+Checker: tpt-solver-check (the trusted kernel) validates the proof. If the simulation drifted and violated a constraint (e.g., cloth clipped through a character's leg), the checker returns Reject.
+Fallback: On Reject, tpt-vfx automatically triggers sub-stepping or switches to a more stable, albeit slower, XPBD (Extended Position Based Dynamics) solver for that specific frame.
+5. Data Flow: Rendering a Fluid Simulation Frame
+Ingest: vfx-scene memory-maps the animation cache.
+Emit: tpt-physics-engine spawns 5 million SPH (Smoothed Particle Hydrodynamics) particles for a water splash.
+Solve (CPU/GPU): tpt-math-pde-operators calculates pressure and viscosity forces. tpt-crucible routes the heavy matrix math to the GPU via WGSL.
+Verify: tpt-solver checks that no fluid particles have teleported through solid geometry (broad-phase collision verification).
+Voxelization: The SPH particles are splatted into the vfx-volume MAC grid, calculating density and velocity fields.
+Raymarch: nova-render dispatches a WGSL compute shader that raymarches the volume, applying Beer-Lambert light absorption and phase functions for photorealistic water rendering.
+Output: The final pixel data is written to an OpenEXR file using the pure-Rust exr crate (MIT).
+6. API Design (High-Level)
+The API should be declarative and node-graph friendly, allowing Technical Directors (TDs) to script complex SFX without writing unsafe code.
+
+use tpt_vfx::prelude::*;
+use tpt_math::units::prelude::*; // Compile-time typed units (meters, seconds)
+
+fn main() -> VfxResult<()> {
+    // 1. Initialize the pure-Rust context
+    let mut ctx = VfxContext::builder()
+        .with_gpu_backend(wgpu::Backends::all())
+        .with_verified_math(true) // Enables tpt-solver certificate checking
+        .build()?;
+
+    // 2. Load scene (Zero-copy memory mapping)
+    let scene = ctx.load_scene("assets/shot_042.vfx")?;
+
+    // 3. Define a Fluid Emitter
+    let emitter = FluidEmitter::new()
+        .position(Point3::new(0.0, 5.0, 0.0))
+        .rate(50_000.particles_per_second())
+        .fluid_type(FluidType::Water);
+
+    // 4. Define the Volume Grid (Sparse Voxel Octree)
+    let mut volume = VolumeGrid::builder()
+        .resolution(VoxelSize::new(0.05.meters()))
+        .advection_scheme(Advection::MacCormack)
+        .build();
+
+    // 5. Simulation Loop
+    for frame in 0..240 {
+        let dt = 1.0 / 24.0;
+        
+        // Physics step (SPH)
+        let particles = ctx.simulate_fluids(&emitter, dt)?;
+        
+        // Verified Constraint Check (Did the water clip through the floor?)
+        let proof = ctx.generate_collision_proof(&particles, &scene.floor);
+        assert!(ctx.verify_certificate(&proof).is_accept(), "Simulation exploded!");
+
+        // Voxelization
+        volume.splat_particles(&particles);
+
+        // Render via wgpu compute shaders
+        let exr_frame = ctx.raymarch_volume(&volume, &scene.lighting)?;
+        
+        // Write to disk (Pure Rust EXR)
+        exr_frame.save(format!("renders/shot_042_{:04}.exr", frame))?;
+    }
+
+    Ok(())
+}
+
+7. Why This Beats the Industry Standard (Houdini/USD)
+Feature
+Legacy C++ VFX (Houdini/OpenVDB)
+tpt-vfx (Pure Rust TPT Stack)
+Memory Safety
+Prone to segfaults on render farms; memory leaks in long simulations.
+100% memory safe. A 72-hour fluid sim will never segfault at hour 71.
+Data Transfer
+Heavy serialization/deserialization between CPU, RAM, and GPU.
+True Zero-Copy. tpt-math vectors cast directly to wgpu buffers via bytemuck.
+Stability
+Artists manually tweak "substeps" to stop cloth/water from exploding.
+tpt-solver mathematically verifies constraints. If it explodes, the engine knows instantly and auto-corrects.
+Licensing
+Proprietary, or reliant on Apache/GPL C++ libs that complicate commercial distribution.
+Strictly MIT (or selectable). Clean for proprietary studio pipelines or open-source release.
+AI Integration
+Bolted-on Python scripts calling external APIs.
+Native integration via tpt-nova (Neural materials, Gaussian Splats, local RAG for asset generation).
+8. Phased Roadmap
+Phase 1: The Foundation (Weeks 1-4)
+Scaffold the tpt-vfx workspace.
+Implement vfx-scene zero-copy memory mapping using memmap2 and bytemuck.
+Wire tpt-physics-engine SPH output into a basic CPU-side voxel grid.
+Phase 2: Volumetrics & WGSL (Weeks 5-8)
+Port the MAC grid and Sparse Voxel Octree to vfx-volume.
+Write the WGSL compute shaders for Navier-Stokes advection/projection using tpt-math-pde-operators.
+Implement basic raymarching in nova-render to visualize the volumes.
+Phase 3: Verification & Ray Tracing (Weeks 9-12)
+Integrate tpt-solver to generate and check collision/constraint proofs post-simulation.
+Build the pure-Rust BVH builder and WGSL ray-intersection shaders in vfx-rays.
+Implement the pure-Rust exr output pipeline.
+Phase 4: AI & Heterogeneous Compute (Weeks 13-16)
+Integrate tpt-crucible to dynamically route simulation steps to CPU, GPU, or NPU based on load.
+Connect nova-splat and nova-neural-materials to allow AI-generated volumetric assets to interact physically with tpt-physics-engine particles.

@@ -1,0 +1,18 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# VFX caches / large outputs
+*.vfx
+*.exr
+*.vdb
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
